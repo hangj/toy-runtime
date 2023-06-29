@@ -1,12 +1,14 @@
 use std::{
-    future::Future,
+    future::{Future, IntoFuture},
     pin::Pin,
     sync::{
         mpsc::{sync_channel, Receiver, SyncSender},
         Arc, Mutex,
     },
-    task::{Context, RawWaker, RawWakerVTable, Waker}, mem::ManuallyDrop,
+    task::{Context, RawWaker, RawWakerVTable, Waker}, mem::ManuallyDrop, ptr::NonNull, os::macos::raw,
 };
+
+use crate::context::get_sender;
 
 pub struct Executor {
     receiver: Receiver<Arc<Task>>,
@@ -16,15 +18,79 @@ pub struct Spawner {
     sender: SyncSender<Arc<Task>>,
 }
 
-struct Task {
-    future: Mutex<Pin<Box<dyn Future<Output = ()>>>>,
+pub struct Task {
+    raw_task: NonNull<()>,
+    vtable: &'static Vtable,
     sender: SyncSender<Arc<Task>>,
 }
 
+pub(super) struct Vtable {
+    /// Polls the future.
+    pub(super) poll: unsafe fn(NonNull<()>, cx: &mut Context<'_>),
+    pub(super) drop: unsafe fn(NonNull<()>),
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        unsafe {(self.vtable.drop)(self.raw_task);}
+    }
+}
+
 impl Task {
+    fn from_raw<T>(raw_task: T, sender: SyncSender<Arc<Task>>) -> Self
+    where
+        T: Future + Send + 'static,
+        T::Output: Send + 'static,
+    {
+        let raw_task = NonNull::new(Box::into_raw(Box::new(raw_task))).unwrap().cast();
+        let vtable = raw_vtable::<T>();
+        Self {
+            raw_task,
+            vtable,
+            sender,
+        }
+    }
+
     fn wake(self: Arc<Self>) {
         self.sender.send(self.clone()).expect("receiver is disconnected or too many tasks queued");
     }
+
+    fn poll(self: Arc<Self>, cx: &mut Context<'_>) {
+        unsafe {(self.vtable.poll)(self.raw_task, cx);}
+    }
+}
+
+fn raw_vtable<T>() -> &'static Vtable 
+where
+    T: Future + Send + 'static,
+    T::Output: Send + 'static,
+{
+    &Vtable {
+        poll: raw_poll::<T>,
+        drop: raw_drop::<T>,
+    }
+}
+
+unsafe fn raw_poll<T>(ptr: NonNull<()>, cx: &mut Context<'_>)
+where
+    T: Future + Send + 'static,
+    T::Output: Send + 'static,
+{
+    let p = ptr.cast::<T>();
+    let mut boxed = Box::from_raw(p.as_ptr());
+    let mut future = Pin::new_unchecked(boxed.as_mut());
+    let _ = future.as_mut().poll(cx).is_pending();
+
+    let _ = ManuallyDrop::new(boxed);
+}
+
+unsafe fn raw_drop<T>(ptr: NonNull<()>)
+where
+    T: Future + Send + 'static,
+    T::Output: Send + 'static,
+{
+    let p = ptr.cast::<T>();
+    let _boxed = Box::from_raw(p.as_ptr());
 }
 
 pub fn new_executor_and_spawner() -> (Executor, Spawner) {
@@ -34,13 +100,14 @@ pub fn new_executor_and_spawner() -> (Executor, Spawner) {
 }
 
 impl Spawner {
-    pub fn spawn(&self, future: impl Future<Output = ()> + 'static + Send) {
-        let future = Box::pin(future);
-        let task = Arc::new(Task {
-            // future: Mutex::new(Some(future)),
-            future: Mutex::new(future),
-            sender: self.sender.clone(),
-        });
+    pub fn spawn<T>(&self, future: T)
+    where
+        T: 'static + Future + Send,
+        T::Output: 'static + Send,
+    {
+        // let future = Box::pin(future);
+        let task = Arc::new(Task::from_raw(future, self.sender.clone() ));
+
         self.sender
             .send(task)
             .expect("receiver is disconnected or too many tasks queued");
@@ -50,7 +117,7 @@ impl Spawner {
 impl Executor {
     pub fn run(self) {
         while let Ok(task) = self.receiver.recv() {
-            let mut future = task.future.lock().unwrap();
+            // let mut future = task.future.lock().unwrap();
             let waker = unsafe {
                 let _ = ManuallyDrop::new(task.clone());
                 Waker::from_raw(RawWaker::new(
@@ -60,8 +127,10 @@ impl Executor {
                 ))
             };
             let mut context = Context::from_waker(&waker);
-            let _ = future.as_mut().poll(&mut context);
+            task.poll(&mut context);
+            // let _ = future.as_mut().poll(&mut context);
         }
+        println!("executor finished.");
     }
 }
 
