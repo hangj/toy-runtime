@@ -1,14 +1,15 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::{
-        mpsc::{sync_channel, Receiver, SyncSender},
-        Arc, Mutex,
-    },
-    task::Context, ptr::NonNull,
+    ptr::NonNull,
+    sync::{Arc, Mutex},
+    task::Context,
 };
 
-use crate::{toy_waker::{ArcWake, self}, msg_queue::{Mq, self}};
+use crate::{
+    msg_queue::{self, Mq},
+    toy_waker::{self, ArcWake},
+};
 
 pub struct Task {
     raw_task: NonNull<()>,
@@ -27,7 +28,9 @@ pub(super) struct Vtable {
 
 impl Drop for Task {
     fn drop(&mut self) {
-        unsafe {(self.vtable.drop)(self.raw_task);}
+        unsafe {
+            (self.vtable.drop)(self.raw_task);
+        }
     }
 }
 
@@ -35,8 +38,8 @@ impl ArcWake for Mutex<Task> {
     fn wake(self: Arc<Self>) {
         let task = self.lock().unwrap();
         // task.sender.send(self.clone()).expect("receiver is disconnected or too many tasks queued");
-        task.sender.send(unsafe{NonNull::new_unchecked(Arc::into_raw(self.clone()).cast_mut())}.cast());
-        
+        task.sender
+            .send(unsafe { NonNull::new_unchecked(Arc::into_raw(self.clone()).cast_mut()) }.cast());
     }
 }
 
@@ -47,7 +50,9 @@ impl Task {
         T: Future + Send + 'static,
         T::Output: Send + 'static,
     {
-        let raw_task = NonNull::new(Box::into_raw(Box::new(future))).unwrap().cast();
+        let raw_task = NonNull::new(Box::into_raw(Box::new(future)))
+            .unwrap()
+            .cast();
         let vtable = raw_vtable::<T>();
         Self {
             raw_task,
@@ -58,7 +63,9 @@ impl Task {
 
     fn poll(this: Arc<Mutex<Self>>, cx: &mut Context<'_>) {
         let task = this.lock().unwrap();
-        unsafe {(task.vtable.poll)(task.raw_task, cx);}
+        unsafe {
+            (task.vtable.poll)(task.raw_task, cx);
+        }
     }
 }
 
@@ -100,21 +107,18 @@ pub struct Toy {
 impl Toy {
     pub fn new() -> Self {
         let (sender, receiver) = Mq::new().split();
-        Self {
-            sender,
-            receiver,
-        }
+        Self { sender, receiver }
     }
 
     pub fn spawn<T>(&self, future: T) -> u64
     where
         T: Future + 'static + Send,
-        T::Output: Send + 'static + Send
+        T::Output: Send + 'static + Send,
     {
-        let task = Arc::new(Mutex::new(Task::from_future(future, self.sender.clone() )));
+        let task = Arc::new(Mutex::new(Task::from_future(future, self.sender.clone())));
 
         self.sender
-            .send(unsafe{NonNull::new_unchecked(Arc::into_raw(task).cast_mut())}.cast());
+            .send(unsafe { NonNull::new_unchecked(Arc::into_raw(task).cast_mut()) }.cast());
         0
     }
 
@@ -130,13 +134,13 @@ impl Toy {
                 let receiver = receiver;
                 loop {
                     let ptr = receiver.recv();
-                    let task = unsafe{Arc::from_raw(ptr.cast().as_ptr())};
+                    let task = unsafe { Arc::from_raw(ptr.cast().as_ptr()) };
                     let waker = toy_waker::waker_by_arc(&task);
                     let mut context = Context::from_waker(&waker);
-        
+
                     Task::poll(task, &mut context);
                 }
-                println!("executor finished.");
+                // println!("executor finished.");
             });
 
             threads.push(th);

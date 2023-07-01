@@ -1,12 +1,11 @@
 mod fake_io;
-mod toy_waker;
-mod toy_runtime;
 mod msg_queue;
+mod toy_runtime;
+mod toy_waker;
 
 use std::time::Duration;
 
 use toy_runtime::Toy;
-
 
 fn main() {
     let toy = Toy::new();

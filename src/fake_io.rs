@@ -26,7 +26,7 @@ impl Future for FakeIO {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let thread_shared_state = self.shared_state.clone();
-        let duration = self.duration.clone();
+        let duration = self.duration;
         let mut shared_state = self.shared_state.lock().unwrap();
 
         thread::spawn(move || {
@@ -61,7 +61,7 @@ impl FakeIO {
 
 #[cfg(test)]
 mod test_pin {
-    use std::{ marker::PhantomPinned, pin::Pin, };
+    use std::{marker::PhantomPinned, pin::Pin};
 
     #[derive(Debug)]
     struct Unmovable {

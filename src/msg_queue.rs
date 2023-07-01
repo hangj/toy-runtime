@@ -1,5 +1,4 @@
-use std::{collections::VecDeque, ptr::NonNull, ops::{Deref, DerefMut}, mem, sync::{Arc, OnceLock}};
-
+use std::{collections::VecDeque, mem, ptr::NonNull, sync::Arc};
 
 pub struct Mq {
     mutex: *mut libc::pthread_mutex_t,
@@ -12,7 +11,7 @@ unsafe impl Sync for Mq {}
 
 impl Drop for Mq {
     fn drop(&mut self) {
-        unsafe{
+        unsafe {
             libc::pthread_mutex_destroy(self.mutex);
             libc::pthread_cond_destroy(self.cond);
             let _ = Box::from_raw(self.mutex);
@@ -58,11 +57,7 @@ impl Mq {
                 panic!("pthread_cond_init failed");
             }
         }
-        Arc::new(Self {
-            mutex,
-            cond,
-            queue,
-        })
+        Arc::new(Self { mutex, cond, queue })
     }
     pub fn split(self: &Arc<Self>) -> (Sender, Receiver) {
         (Sender(self.clone()), Receiver(self.clone()))
@@ -79,7 +74,7 @@ impl Mq {
         self.unlock();
     }
     pub fn recv(self: &Arc<Self>) -> NonNull<()> {
-        let mut boxed = unsafe {Box::from_raw(self.queue)};
+        let mut boxed = unsafe { Box::from_raw(self.queue) };
         loop {
             self.lock();
 
@@ -90,19 +85,26 @@ impl Mq {
                 return future;
             }
 
-            unsafe {libc::pthread_cond_wait(self.cond,  self.mutex);}
+            unsafe {
+                libc::pthread_cond_wait(self.cond, self.mutex);
+            }
             self.unlock();
         }
     }
 
-    #[inline] fn lock(self: &Arc<Self>) {
-        unsafe {libc::pthread_mutex_lock(self.mutex.clone());}
+    #[inline]
+    fn lock(self: &Arc<Self>) {
+        unsafe {
+            libc::pthread_mutex_lock(self.mutex);
+        }
     }
-    #[inline] fn unlock(self: &Arc<Self>) {
-        unsafe {libc::pthread_mutex_unlock(self.mutex);}
+    #[inline]
+    fn unlock(self: &Arc<Self>) {
+        unsafe {
+            libc::pthread_mutex_unlock(self.mutex);
+        }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -118,16 +120,16 @@ mod tests {
 
         for i in 0..4 {
             let mq_cloned = mq.clone();
-            
+
             let th = std::thread::spawn(move || {
                 let mq = mq_cloned;
                 loop {
                     println!("thread({}) wait popping", i);
                     let msg = mq.recv();
-                    let boxed = unsafe{Box::from_raw(msg.cast::<i32>().as_ptr())};
+                    let boxed = unsafe { Box::from_raw(msg.cast::<i32>().as_ptr()) };
                     println!("thread({}) got boxed {}", i, *boxed);
 
-                    let rand = unsafe{libc::rand()}.abs_diff(1) % 3;
+                    let rand = unsafe { libc::rand() }.abs_diff(1) % 3;
                     std::thread::sleep(Duration::from_secs(rand as u64));
                 }
             });
@@ -136,9 +138,7 @@ mod tests {
         }
 
         for i in 0..50 {
-            let msg = unsafe {
-                NonNull::new_unchecked(Box::into_raw(Box::new(i)))
-            };
+            let msg = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(i))) };
             mq.send(msg.cast());
         }
 
