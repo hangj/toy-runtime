@@ -64,9 +64,8 @@ impl Mq {
     }
     pub fn send(self: &Arc<Self>, msg: NonNull<()>) {
         self.lock();
-        let mut boxed = unsafe { Box::from_raw(self.queue) };
-        boxed.push_back(msg);
-        Box::leak(boxed);
+        let queue = Box::leak(unsafe { Box::from_raw(self.queue) });
+        queue.push_back(msg);
 
         // unsafe { libc::pthread_cond_broadcast(&mut self.cond) };
         unsafe { libc::pthread_cond_signal(self.cond) };
@@ -74,12 +73,11 @@ impl Mq {
         self.unlock();
     }
     pub fn recv(self: &Arc<Self>) -> NonNull<()> {
-        let mut boxed = unsafe { Box::from_raw(self.queue) };
+        let queue = Box::leak(unsafe { Box::from_raw(self.queue) });
         loop {
             self.lock();
 
-            if let Some(future) = boxed.pop_front() {
-                Box::leak(boxed);
+            if let Some(future) = queue.pop_front() {
                 self.unlock();
 
                 return future;
@@ -129,7 +127,7 @@ mod tests {
                     let boxed = unsafe { Box::from_raw(msg.cast::<i32>().as_ptr()) };
                     println!("thread({}) got boxed {}", i, *boxed);
 
-                    let rand = unsafe { libc::rand() }.abs_diff(1) % 3;
+                    let rand = unsafe { libc::rand() }.abs_diff(1) % 5;
                     std::thread::sleep(Duration::from_secs(rand as u64));
                 }
             });
