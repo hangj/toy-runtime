@@ -42,7 +42,7 @@ impl Clone for RawTask {
 
 impl Drop for RawTask {
     fn drop(&mut self) {
-        unsafe { (self.header().vtable.dealloc_task)(self.ptr) }
+        unsafe { (self.header().vtable.drop_task)(self.ptr) }
     }
 }
 
@@ -54,6 +54,8 @@ struct Header {
 /// repr(C) 确保指针 `*mut Cell<T>` 转换成 `*mut Header` 时有效, 
 /// 因为默认情况下 Rust 的数据布局不一定会按照 field 的声明顺序排列
 /// [The Default Representation](https://doc.rust-lang.org/reference/type-layout.html?#the-default-representation)
+/// 
+/// [playground](https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=39ac84782d121970598b91201b168f82)
 #[repr(C)]
 struct Cell<T> {
     header: Header,
@@ -63,7 +65,7 @@ struct Cell<T> {
 struct Vtable {
     poll_task: unsafe fn(NonNull<Header>),
     clone_task: unsafe fn(NonNull<Header>) -> NonNull<Header>,
-    dealloc_task: unsafe fn(NonNull<Header>),
+    drop_task: unsafe fn(NonNull<Header>),
 }
 
 unsafe fn poll_task<T: Future>(ptr: NonNull<Header>) {
@@ -87,7 +89,7 @@ unsafe fn clone_task<T>(ptr: NonNull<Header>) -> NonNull<Header> {
     Arc::increment_strong_count(cell);
     ptr
 }
-unsafe fn dealloc_task<T>(ptr: NonNull<Header>) {
+unsafe fn drop_task<T>(ptr: NonNull<Header>) {
     let ptr = ptr.cast::<Cell<T>>().as_ptr();
     Arc::decrement_strong_count(ptr);
 }
@@ -129,7 +131,7 @@ impl Task {
             vtable: &Vtable {
                 poll_task: poll_task::<T>,
                 clone_task: clone_task::<T>,
-                dealloc_task: dealloc_task::<T>,
+                drop_task: drop_task::<T>,
             },
             sender,
         };
@@ -149,9 +151,9 @@ fn spawn<T: Future>(future: T, sender: crossbeam::channel::Sender<Task>) {
     sender.send(task).unwrap();
 }
 
-fn run(rx: crossbeam::channel::Receiver<Task>) {
+fn run(rx: crossbeam::channel::Receiver<Task>, nthread: usize) {
     let mut threads = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..nthread {
         let rx = rx.clone();
         let th = std::thread::spawn(move || {
             while let Ok(task) = rx.recv() {
@@ -171,14 +173,49 @@ fn run(rx: crossbeam::channel::Receiver<Task>) {
 #[cfg(test)]
 mod tests {
     use crate::fake_io::FakeIO;
+    use crossbeam::channel;
 
     use super::*;
 
+    struct Toy {
+        tx: channel::Sender<Task>,
+        rx: channel::Receiver<Task>,
+    }
+
+    impl Toy {
+        fn new() -> Self {
+            let (tx, rx) = crossbeam::channel::unbounded::<Task>();
+            Self {tx, rx}
+        }
+        fn spawn<T: Future>(&self, future: T) {
+            spawn(future, self.tx.clone());
+        }
+        fn run(self, nthread: usize) {
+            drop(self.tx);
+            run(self.rx, nthread);
+        }
+    }
+
+    #[test]
+    fn test_toy() {
+        let toy = Toy::new();
+        for i in 1..=20 {
+            toy.spawn(async move {
+                let duration = FakeIO::new(std::time::Duration::from_secs(i)).await;
+                println!("{}: {:?}", i, duration);
+            });
+        }
+        toy.run(4);
+    }
+
     #[test]
     fn test() {
+        let nfuture = 100;
+        let nthread = 4;
+
         let (tx, rx) = crossbeam::channel::unbounded::<Task>();
 
-        for i in 0..10 {
+        for i in 0..nfuture {
             let sender = tx.clone();
             spawn(async move {
                 let duration = FakeIO::new(std::time::Duration::from_secs(i)).await;
@@ -188,6 +225,6 @@ mod tests {
 
         drop(tx);
 
-        run(rx);
+        run(rx, nthread);
     }
 }
