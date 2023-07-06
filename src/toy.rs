@@ -2,8 +2,8 @@ use std::{
     future::Future,
     pin::Pin,
     ptr::NonNull,
-    sync::Arc,
-    task::{Context, RawWaker, RawWakerVTable, Waker},
+    sync::{Arc, Mutex},
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
 #[derive(Clone)]
@@ -47,19 +47,30 @@ impl Drop for RawTask {
 }
 
 struct Header {
+    // state: AtomicUsize,
+    state: Mutex<State>,
     vtable: &'static Vtable,
     sender: crossbeam::channel::Sender<Task>,
 }
 
-/// repr(C) 确保指针 `*mut Cell<T>` 转换成 `*mut Header` 时有效, 
-/// 因为默认情况下 Rust 的数据布局不一定会按照 field 的声明顺序排列
-/// [The Default Representation](https://doc.rust-lang.org/reference/type-layout.html?#the-default-representation)
-/// 
-/// [playground](https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=39ac84782d121970598b91201b168f82)
+#[derive(Default)]
+struct State {
+    running: bool,
+    notified: bool,
+    completed: bool,
+}
+
+// #[repr(C)] make sure `*mut Cell<T>` can cast to valid `*mut Header`, and backwards. 
+// In the default situation, the data layout may not be the same as the order in which the fields are specified in the declaration of the type
+// 默认情况下 Rust 的数据布局不一定会按照 field 的声明顺序排列
+// [The Default Representation](https://doc.rust-lang.org/reference/type-layout.html?#the-default-representation)
+//
+// [playground](https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=39ac84782d121970598b91201b168f82)
 #[repr(C)]
-struct Cell<T> {
+struct Cell<T: Future> {
     header: Header,
     future: T,
+    output: Option<T::Output>,
 }
 
 struct Vtable {
@@ -68,8 +79,22 @@ struct Vtable {
     drop_task: unsafe fn(NonNull<Header>),
 }
 
-unsafe fn poll_task<T: Future>(ptr: NonNull<Header>) {
-    let ptr = ptr.cast::<Cell<T>>().as_ptr();
+unsafe fn poll_task<T: Future>(non_null: NonNull<Header>) {
+    let ptr = non_null.cast::<Cell<T>>().as_ptr();
+    let state = &(*ptr).header.state;
+    {
+        let mut state = state.lock().unwrap();
+        if state.completed {
+            return;
+        }
+        if state.running {
+            state.notified = true;
+            return;
+        }
+        state.running = true;
+        state.notified = false;
+    }
+
     Arc::increment_strong_count(ptr);
     let waker = Waker::from_raw(RawWaker::new(
         ptr.cast(),
@@ -82,19 +107,43 @@ unsafe fn poll_task<T: Future>(ptr: NonNull<Header>) {
     ));
     let mut cx = Context::from_waker(&waker);
     let pin = Pin::new_unchecked(&mut (*ptr).future);
-    let _ = pin.poll(&mut cx);
+
+    let is_completed = if let Poll::Ready(output) = pin.poll(&mut cx) {
+        (*ptr).output = Some(output);
+        true
+    } else {
+        false
+    };
+
+    {
+        let mut state = state.lock().unwrap();
+        state.running = false;
+        if is_completed {
+            state.completed = true;
+            return;
+        }
+        if state.notified {
+            drop(state);
+            // send the task
+            Arc::increment_strong_count(ptr);
+            let task = Task {
+                raw: RawTask { ptr: non_null },
+            };
+            (*ptr).header.sender.send(task).unwrap();
+        }
+    }
 }
-unsafe fn clone_task<T>(ptr: NonNull<Header>) -> NonNull<Header> {
+unsafe fn clone_task<T: Future>(ptr: NonNull<Header>) -> NonNull<Header> {
     let cell = ptr.cast::<Cell<T>>().as_ptr();
     Arc::increment_strong_count(cell);
     ptr
 }
-unsafe fn drop_task<T>(ptr: NonNull<Header>) {
+unsafe fn drop_task<T: Future>(ptr: NonNull<Header>) {
     let ptr = ptr.cast::<Cell<T>>().as_ptr();
     Arc::decrement_strong_count(ptr);
 }
 
-unsafe fn clone_waker<T>(ptr: *const ()) -> RawWaker {
+unsafe fn clone_waker<T: Future>(ptr: *const ()) -> RawWaker {
     let cell = ptr.cast::<Cell<T>>();
     Arc::increment_strong_count(cell);
     RawWaker::new(
@@ -107,11 +156,11 @@ unsafe fn clone_waker<T>(ptr: *const ()) -> RawWaker {
         ),
     )
 }
-unsafe fn drop_waker<T>(ptr: *const ()) {
+unsafe fn drop_waker<T: Future>(ptr: *const ()) {
     let ptr = ptr.cast::<Cell<T>>();
     Arc::decrement_strong_count(ptr);
 }
-unsafe fn wake_by_val<T>(ptr: *const ()) {
+unsafe fn wake_by_val<T: Future>(ptr: *const ()) {
     let ptr = ptr.cast::<Cell<T>>();
     let raw = RawTask {
         ptr: NonNull::new_unchecked(ptr.cast::<Header>().cast_mut()),
@@ -120,7 +169,7 @@ unsafe fn wake_by_val<T>(ptr: *const ()) {
 
     (*ptr).header.sender.send(task).unwrap();
 }
-unsafe fn wake_by_ref<T>(ptr: *const ()) {
+unsafe fn wake_by_ref<T: Future>(ptr: *const ()) {
     Arc::increment_strong_count(ptr.cast::<Cell<T>>());
     wake_by_val::<T>(ptr);
 }
@@ -128,6 +177,7 @@ unsafe fn wake_by_ref<T>(ptr: *const ()) {
 impl Task {
     fn new<T: Future>(future: T, sender: crossbeam::channel::Sender<Task>) -> Self {
         let header = Header {
+            state: Mutex::new(State::default()),
             vtable: &Vtable {
                 poll_task: poll_task::<T>,
                 clone_task: clone_task::<T>,
@@ -135,7 +185,11 @@ impl Task {
             },
             sender,
         };
-        let cell = Arc::into_raw(Arc::new(Cell { header, future }));
+        let cell = Arc::into_raw(Arc::new(Cell {
+            header,
+            future,
+            output: None,
+        }));
         let ptr = cell.cast::<Header>().cast_mut();
 
         Self {
@@ -169,32 +223,29 @@ fn run(rx: crossbeam::channel::Receiver<Task>, nthread: usize) {
     }
 }
 
+pub struct Toy {
+    tx: crossbeam::channel::Sender<Task>,
+    rx: crossbeam::channel::Receiver<Task>,
+}
+
+impl Toy {
+    pub fn new() -> Self {
+        let (tx, rx) = crossbeam::channel::unbounded::<Task>();
+        Self { tx, rx }
+    }
+    pub fn spawn<T: Future>(&self, future: T) {
+        spawn(future, self.tx.clone());
+    }
+    pub fn run(self, nthread: usize) {
+        drop(self.tx);
+        run(self.rx, nthread);
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use crate::fake_io::FakeIO;
-    use crossbeam::channel;
-
     use super::*;
-
-    struct Toy {
-        tx: channel::Sender<Task>,
-        rx: channel::Receiver<Task>,
-    }
-
-    impl Toy {
-        fn new() -> Self {
-            let (tx, rx) = crossbeam::channel::unbounded::<Task>();
-            Self {tx, rx}
-        }
-        fn spawn<T: Future>(&self, future: T) {
-            spawn(future, self.tx.clone());
-        }
-        fn run(self, nthread: usize) {
-            drop(self.tx);
-            run(self.rx, nthread);
-        }
-    }
+    use crate::fake_io::FakeIO;
 
     #[test]
     fn test_toy() {
@@ -217,10 +268,13 @@ mod tests {
 
         for i in 0..nfuture {
             let sender = tx.clone();
-            spawn(async move {
-                let duration = FakeIO::new(std::time::Duration::from_secs(i)).await;
-                println!("{}: {:?}", i, duration);
-            }, sender);
+            spawn(
+                async move {
+                    let duration = FakeIO::new(std::time::Duration::from_secs(i)).await;
+                    println!("{}: {:?}", i, duration);
+                },
+                sender,
+            );
         }
 
         drop(tx);

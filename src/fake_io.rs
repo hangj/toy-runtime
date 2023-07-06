@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     sync::{Arc, Mutex},
-    task::{Poll, Waker},
+    task::Poll,
     thread,
     time::Duration,
 };
@@ -15,7 +15,6 @@ pub struct FakeIO {
 #[derive(Default)]
 struct SharedState {
     completed: bool,
-    waker: Option<Waker>,
 }
 
 impl Future for FakeIO {
@@ -25,26 +24,26 @@ impl Future for FakeIO {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let thread_shared_state = self.shared_state.clone();
+        let state = self.shared_state.lock().unwrap();
+        if state.completed {
+            return Poll::Ready(self.duration);
+        }
+
+        let state = self.shared_state.clone();
+        let waker = cx.waker().clone();
         let duration = self.duration;
-        let mut shared_state = self.shared_state.lock().unwrap();
 
         thread::spawn(move || {
             thread::sleep(duration);
 
-            let mut shared_state = thread_shared_state.lock().unwrap();
-            shared_state.completed = true;
-
-            if let Some(waker) = shared_state.waker.take() {
-                waker.wake();
+            {
+                let mut state = state.lock().unwrap();
+                state.completed = true;
             }
+
+            waker.wake();
         });
 
-        if shared_state.completed {
-            return Poll::Ready(self.duration);
-        }
-
-        shared_state.waker = Some(cx.waker().clone());
         Poll::Pending
     }
 }

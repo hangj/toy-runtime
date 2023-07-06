@@ -1,12 +1,8 @@
-mod fake_io;
-mod toy;
+# toy-rumtime
 
-use toy::Toy;
+Demonstrates rust async runtime
 
-use fake_io::FakeIO;
-use std::thread;
-use std::time::Duration;
-
+```rust
 fn main() {
     let toy = Toy::new();
 
@@ -17,5 +13,6 @@ fn main() {
         })
     }
 
-    toy.run(4);
+    toy.run(4); // 4 threads
 }
+```
