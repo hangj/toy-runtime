@@ -1,4 +1,33 @@
-use std::{collections::VecDeque, mem, ptr::NonNull, sync::Arc};
+use std::{
+    collections::VecDeque,
+    mem,
+    ptr::NonNull,
+    sync::{Arc, Condvar, Mutex},
+};
+
+struct MessageQueue {
+    queue: Mutex<VecDeque<NonNull<()>>>,
+    cond: Condvar,
+}
+
+impl MessageQueue {
+    pub fn new() -> Self {
+        Self {
+            cond: Condvar::new(),
+            queue: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    pub fn recv(&mut self) -> NonNull<()> {
+        let mut queue = self.queue.lock().unwrap();
+        if queue.is_empty() {
+            let queue = self.cond.wait(queue);
+            queue.unwrap().pop_front().unwrap()
+        } else {
+            queue.pop_front().unwrap()
+        }
+    }
+}
 
 pub struct Mq {
     mutex: *mut libc::pthread_mutex_t,
