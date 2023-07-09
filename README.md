@@ -1,6 +1,6 @@
 # toy-rumtime
 
-Demonstrates rust async runtime
+Demonstrates rust async runtime, just show how `Future` `Waker` `vtable` work.
 
 ```rust
 fn main() {
