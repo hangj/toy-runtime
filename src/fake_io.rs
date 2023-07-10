@@ -1,6 +1,9 @@
 use std::{
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     task::Poll,
     thread,
     time::Duration,
@@ -8,13 +11,8 @@ use std::{
 
 #[derive(Default)]
 pub struct FakeIO {
-    shared_state: Arc<Mutex<SharedState>>,
+    finished: Arc<AtomicBool>,
     duration: Duration,
-}
-
-#[derive(Default)]
-struct SharedState {
-    completed: bool,
 }
 
 impl Future for FakeIO {
@@ -24,22 +22,18 @@ impl Future for FakeIO {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let state = self.shared_state.lock().unwrap();
-        if state.completed {
+        if self.finished.load(Ordering::Acquire) {
             return Poll::Ready(self.duration);
         }
 
-        let state = self.shared_state.clone();
+        let finished = self.finished.clone();
         let waker = cx.waker().clone();
         let duration = self.duration;
 
         thread::spawn(move || {
             thread::sleep(duration);
 
-            {
-                let mut state = state.lock().unwrap();
-                state.completed = true;
-            }
+            finished.store(true, Ordering::Release);
 
             waker.wake();
         });
@@ -50,9 +44,8 @@ impl Future for FakeIO {
 
 impl FakeIO {
     pub fn new(duration: Duration) -> Self {
-        let shared_state = Arc::new(Mutex::new(SharedState::default()));
         Self {
-            shared_state,
+            finished: Arc::new(false.into()),
             duration,
         }
     }
