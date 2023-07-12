@@ -6,7 +6,6 @@ use std::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-#[derive(Clone)]
 struct Task {
     raw: RawTask,
 }
@@ -14,17 +13,8 @@ struct Task {
 unsafe impl Send for Task {}
 unsafe impl Sync for Task {}
 
-impl Task {
-    fn poll(self) {
-        let header = self.raw.header();
-        unsafe {
-            (header.vtable.poll_task)(self.raw.ptr);
-        }
-    }
-}
-
 struct RawTask {
-    ptr: NonNull<Header>,
+    ptr: NonNull<Header>, // pointer to Cell<T> where T: Future
 }
 
 impl RawTask {
@@ -47,7 +37,7 @@ impl Drop for RawTask {
 }
 
 struct Header {
-    // state: AtomicUsize,
+    // todo: maybe replace the Mutex<State> with AtomicUsize
     state: Mutex<State>,
     vtable: &'static Vtable,
     sender: crossbeam::channel::Sender<Task>,
@@ -60,12 +50,14 @@ struct State {
     completed: bool,
 }
 
-// #[repr(C)] make sure `*mut Cell<T>` can cast to valid `*mut Header`, and backwards. 
-// In the default situation, the data layout may not be the same as the order in which the fields are specified in the declaration of the type
-// 默认情况下 Rust 的数据布局不一定会按照 field 的声明顺序排列
-// [The Default Representation](https://doc.rust-lang.org/reference/type-layout.html?#the-default-representation)
-//
-// [playground](https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=39ac84782d121970598b91201b168f82)
+/// #[repr(C)] make sure `*mut Cell<T>` can cast to valid `*mut Header`, and backwards. 
+/// In the default situation, the data layout may not be the same as the order in which the fields are specified in the declaration of the type
+/// 默认情况下 Rust 的数据布局不一定会按照 field 的声明顺序排列
+/// [The Default Representation](https://doc.rust-lang.org/reference/type-layout.html?#the-default-representation)
+///
+/// [playground link](https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=39ac84782d121970598b91201b168f82)
+/// 
+/// you can easilly view the data layout with this crate https://github.com/hangj/layout-rs
 #[repr(C)]
 struct Cell<T: Future> {
     header: Header,
@@ -83,6 +75,8 @@ unsafe fn poll_task<T: Future>(non_null: NonNull<Header>) {
     let ptr = non_null.cast::<Cell<T>>().as_ptr();
     let state = &(*ptr).header.state;
     {
+        // The future can be waked by multiple wakers, so this task may be polled 
+        // by more than one thread at the same time
         let mut state = state.lock().unwrap();
         if state.completed {
             return;
@@ -116,6 +110,7 @@ unsafe fn poll_task<T: Future>(non_null: NonNull<Header>) {
     };
 
     {
+        // if the task is polled again when running, we just need to send it back to the channel
         let mut state = state.lock().unwrap();
         state.running = false;
         if is_completed {
@@ -198,6 +193,13 @@ impl Task {
             },
         }
     }
+
+    fn poll(self) {
+        let header = self.raw.header();
+        unsafe {
+            (header.vtable.poll_task)(self.raw.ptr);
+        }
+    }
 }
 
 fn spawn<T: Future>(future: T, sender: crossbeam::channel::Sender<Task>) {
@@ -230,7 +232,7 @@ pub struct Toy {
 
 impl Toy {
     pub fn new() -> Self {
-        let (tx, rx) = crossbeam::channel::unbounded::<Task>();
+        let (tx, rx) = crossbeam::channel::bounded::<Task>(1024);
         Self { tx, rx }
     }
     pub fn spawn<T: Future>(&self, future: T) {

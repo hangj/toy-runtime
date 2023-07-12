@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-#[derive(Default)]
 pub struct FakeIO {
     finished: Arc<AtomicBool>,
     duration: Duration,
