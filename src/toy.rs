@@ -1,10 +1,33 @@
 use std::{
-    future::Future,
-    pin::Pin,
-    ptr::NonNull,
-    sync::{Arc, Mutex},
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    future::Future, marker::PhantomData, pin::Pin, ptr::NonNull, sync::{Arc, Mutex}, task::{Context, Poll, RawWaker, RawWakerVTable, Waker}
 };
+
+pub struct Handle<Out> {
+    ptr: NonNull<Header>,
+    _unused: PhantomData<Out>,
+}
+
+impl<Out> Handle<Out> {
+    pub fn read_output(&mut self) -> Option<Out> {
+        let header = unsafe{self.ptr.as_mut()};
+
+        let mut out: Option<Out> = None;
+        let dst = &mut out;
+        unsafe {
+            (header.vtable.read_output)(self.ptr, dst as *mut _ as _)
+        }
+
+        out
+    }
+}
+
+impl<Out> Drop for Handle<Out> {
+    fn drop(&mut self) {
+        unsafe {
+            (self.ptr.as_ref().vtable.drop_task)(self.ptr);
+        }
+    }
+}
 
 struct Task {
     raw: RawTask,
@@ -69,6 +92,7 @@ struct Vtable {
     poll_task: unsafe fn(NonNull<Header>),
     clone_task: unsafe fn(NonNull<Header>) -> NonNull<Header>,
     drop_task: unsafe fn(NonNull<Header>),
+    read_output: unsafe fn(NonNull<Header>, *mut ()),
 }
 
 unsafe fn poll_task<T: Future>(non_null: NonNull<Header>) {
@@ -137,6 +161,11 @@ unsafe fn drop_task<T: Future>(ptr: NonNull<Header>) {
     let ptr = ptr.cast::<Cell<T>>().as_ptr();
     Arc::decrement_strong_count(ptr);
 }
+unsafe fn read_output<T:Future>(ptr: NonNull<Header>, dst: *mut ()) {
+    let cell = ptr.cast::<Cell<T>>().as_mut();
+    let out = &mut *(dst as *mut Option<T::Output>);
+    *out = cell.output.take();
+}
 
 unsafe fn clone_waker<T: Future>(ptr: *const ()) -> RawWaker {
     let cell = ptr.cast::<Cell<T>>();
@@ -177,6 +206,7 @@ impl Task {
                 poll_task: poll_task::<T>,
                 clone_task: clone_task::<T>,
                 drop_task: drop_task::<T>,
+                read_output: read_output::<T>,
             },
             sender,
         };
@@ -202,9 +232,18 @@ impl Task {
     }
 }
 
-fn spawn<T: Future>(future: T, sender: crossbeam::channel::Sender<Task>) {
+fn spawn<T: Future>(future: T, sender: crossbeam::channel::Sender<Task>) -> Handle<T::Output> {
     let task = Task::new(future, sender.clone());
+
+    let ptr = unsafe { (task.raw.header().vtable.clone_task)(task.raw.ptr) };
+    let handle = Handle {
+        ptr,
+        _unused: PhantomData,
+    };
+
     sender.send(task).unwrap();
+
+    handle
 }
 
 fn run(rx: crossbeam::channel::Receiver<Task>, nthread: usize) {
@@ -235,8 +274,8 @@ impl Toy {
         let (tx, rx) = crossbeam::channel::bounded::<Task>(1024);
         Self { tx, rx }
     }
-    pub fn spawn<T: Future>(&self, future: T) {
-        spawn(future, self.tx.clone());
+    pub fn spawn<T: Future>(&self, future: T) -> Handle<T::Output> {
+        spawn(future, self.tx.clone())
     }
     pub fn run(self, nthread: usize) {
         drop(self.tx);

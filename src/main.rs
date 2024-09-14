@@ -14,7 +14,7 @@ fn main() {
         toy.spawn(async move {
             let ret = FakeIO::new(Duration::from_secs(i)).await;
             println!("{:?}: {:?}", thread::current().id(), ret);
-        })
+        });
     }
 
     toy.run(4);
